@@ -61,12 +61,12 @@ class Trainer(object):
         self.iteration_log.append(run_log)
 
     def batch_train(self, X, y):
+        self.optimizer.zero_grad()
         preds = self.model.forward(X)
         loss = self.loss_function(preds, y)
-        self.model.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return loss.clone().detach().cpu().numpy()
+        return loss.item()
     
     def epoch_train(self, dataloader, max_train_epoch_size):
         
@@ -84,15 +84,15 @@ class Trainer(object):
         training_time = (datetime.datetime.now() - train_start_time).total_seconds()
         mean_train_loss = train_loss/len(dataloader)
 
-        if self.verbose:
-            print('Epoch training done.')
-            print('Training time:', training_time)
-            print('Number of training iterations:', batch_idx+1)
-            print('Mean training loss:', mean_train_loss)
+        train_info_dict = {}
+        train_info_dict['time'] = training_time
+        train_info_dict['n_iterations'] = batch_idx + 1
+        train_info_dict['loss'] = mean_train_loss
 
-        return mean_train_loss
+        return train_info_dict
     
     def epoch_eval(self, dataloader, max_eval_epoch_size):
+        eval_start_time = datetime.datetime.now()
         with torch.no_grad():
 
             eval_loss = 0
@@ -100,25 +100,25 @@ class Trainer(object):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
                 preds = self.model.forward(X_batch)
-                eval_loss += self.loss_function(preds, y_batch).clone().detach().cpu().numpy()
+                eval_loss += self.loss_function(preds, y_batch).item()
                 
                 if batch_idx > max_eval_epoch_size:
                     break   
+        eval_time = (datetime.datetime.now() - eval_start_time).total_seconds()
+        mean_eval_loss = eval_loss/len(dataloader)
 
-            mean_eval_loss = eval_loss/len(dataloader)
+        eval_info_dict = {}
+        eval_info_dict['time'] = eval_time
+        eval_info_dict['n_iterations'] = batch_idx + 1
+        eval_info_dict['loss'] = mean_eval_loss
 
-        if self.verbose:
-            print('Epoch evaluation done.')
-            print('Number of evaluation iterations:', batch_idx+1)
-            print('Mean evaluation loss:', mean_eval_loss)
-
-        return mean_eval_loss
+        return eval_info_dict
 
     def train_eval_procedure(self, train_data, eval_data, batch_size, max_epochs, 
                             shuffle=True, early_stopping_patience=10, max_train_epoch_size=1e4, max_eval_epoch_size=1e3, run_comment='No comments.',
-                            do_train=True, do_eval=True):
-        train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=shuffle) if do_train else None
-        eval_dataloader = DataLoader(eval_data, batch_size=batch_size, shuffle=shuffle) if do_eval else None
+                            do_train=True, do_eval=True, custom_collate=None):
+        train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=shuffle, collate_fn=custom_collate) if do_train else None
+        eval_dataloader = DataLoader(eval_data, batch_size=batch_size, shuffle=shuffle, collate_fn=custom_collate) if do_eval else None
         best_eval_loss = np.inf
         best_epoch = 0
         self.prerun_check()
@@ -127,42 +127,39 @@ class Trainer(object):
         eval_loss_log = []
 
         for epoch in range(max_epochs):
-            try:
-                if self.verbose:
-                    print('Epoch number:', epoch)
 
-                if do_train:
-                    mean_train_loss = self.epoch_train(train_dataloader, max_train_epoch_size)
-                    train_loss_log.append(mean_train_loss)
-                
-                if do_eval:
-                    mean_eval_loss = self.epoch_eval(eval_dataloader, max_eval_epoch_size)
-                    eval_loss_log.append(mean_eval_loss)
+            if do_train:
+                train_info_dict = self.epoch_train(train_dataloader, max_train_epoch_size)
+                train_loss_log.append(train_info_dict['loss'])
+            
+            if do_eval:
+                eval_info_dict = self.epoch_eval(eval_dataloader, max_eval_epoch_size)
+                eval_loss_log.append(eval_info_dict['loss'])
 
-                if do_eval and (mean_eval_loss < best_eval_loss):
-                    best_eval_loss = mean_eval_loss
-                    best_epoch = epoch
-                    if self.save_model_flag:
-                        self.best_model = copy.deepcopy(self.model) 
-                    if self.verbose:
-                        print('New best model!')
-                elif do_eval and (epoch - best_epoch > early_stopping_patience):
-                    print('Early stopping. Eval_loss has not improved since epoch number:', best_epoch)
-                    break
+            if self.verbose:
+                print(
+                    'Epoch Number:', epoch + 1, 
+                    '\t| Training time:', f'{int(train_info_dict["time"]// 60)}:{int(train_info_dict["time"] % 60)}', 
+                    '\t| Evaluation time:', f'{int(eval_info_dict["time"] // 60)}:{int(eval_info_dict["time"] % 60)}', 
+                    '\t| epoch train loss:', train_loss_log[-1], 
+                    '\t| epoch eval loss:', eval_loss_log[-1]
+                )
 
-                if do_eval and self.lr_scheduler is not None:
-                    self.lr_scheduler.step(mean_eval_loss)
-                
-                if self.verbose:
-                    print()                
-
-            except KeyboardInterrupt:
-                print("Interrupted by request.")
+            if do_eval and (eval_info_dict['loss'] < best_eval_loss):
+                best_eval_loss = eval_info_dict['loss']
+                best_epoch = epoch
+                if self.save_model_flag:
+                    self.best_model = copy.deepcopy(self.model) 
+            elif do_eval and (epoch - best_epoch > early_stopping_patience):
+                print('Early stopping. Eval_loss has not improved since epoch number:', best_epoch)
                 break
-            except Exception as e:
-                print("Failed train/eval")
-                print(e)
-                break
+
+            if do_eval and self.lr_scheduler is not None:
+                self.lr_scheduler.step(eval_info_dict['loss'])
+            
+            if self.verbose:
+                print()                
+
         self.iteration_log[-1]['model_description'] = str(self.model)
         self.iteration_log[-1]['train_loss_log'] = train_loss_log
         self.iteration_log[-1]['eval_loss_log'] = eval_loss_log
